@@ -65,6 +65,8 @@ services:
     build:
       context: .
       dockerfile: backend-web/Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-mirrors.aliyun.com}
     container_name: xianyu-backend-web
     restart: unless-stopped
     environment:
@@ -129,6 +131,8 @@ services:
     build:
       context: .
       dockerfile: websocket/Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-mirrors.aliyun.com}
     container_name: xianyu-websocket
     restart: unless-stopped
     environment:
@@ -185,6 +189,8 @@ services:
     build:
       context: .
       dockerfile: scheduler/Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-mirrors.aliyun.com}
     container_name: xianyu-scheduler
     restart: unless-stopped
     environment:

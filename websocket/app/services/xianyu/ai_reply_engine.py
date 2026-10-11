@@ -16,6 +16,7 @@ import asyncio
 import json
 import time
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -24,6 +25,20 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.db.session import async_session_maker
+
+# 上下文与输出上限：客服回复只需几十字，历史只保留最近几轮，避免输入膨胀
+AI_HISTORY_MAX_MESSAGES = 10
+AI_HISTORY_MAX_CHARS_PER_MESSAGE = 200
+AI_REPLY_MAX_TOKENS = 300
+ABNORMAL_REPLY_MARKERS = (
+    "coding assistant",
+    "i'm claude",
+    "i am claude",
+    "made by anthropic",
+    "anthropic 开发",
+    "ai 编程助手",
+    "ai编程助手",
+)
 from common.models.xy_account import XYAccount
 from common.models.ai_chat_message import AIChatMessage
 from app.services.xianyu.resource_manager import pause_manager
@@ -156,6 +171,18 @@ class AIReplyEngine:
 
         return self._shorten_text(text)
 
+    @staticmethod
+    def _is_abnormal_reply(text: Any) -> bool:
+        """识别模型"串台"产生的异常回复（如中转站注入编程助手人设后输出的英文自我介绍）"""
+        content = str(text or "").strip()
+        if not content:
+            return True
+        lowered = content.lower()
+        if any(marker in lowered for marker in ABNORMAL_REPLY_MARKERS):
+            return True
+        has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in content)
+        return not has_cjk and len(content) > 40
+
     def _build_openai_messages(self, messages: List[Dict]) -> List[Dict]:
         patched_messages = []
         direct_rule = "重要：只输出给买家的最终回复文本，不要输出思考过程、分析过程或解释，回复控制在40字以内。"
@@ -181,6 +208,35 @@ class AIReplyEngine:
                 converted_messages.append(msg)
         return converted_messages
 
+    async def _collect_openai_stream(self, stream: Any, model_name: Any) -> Any:
+        """把流式分片拼成与非流式一致的结构（choices[0].message.content / finish_reason）"""
+        parts: List[str] = []
+        finish_reason = None
+        usage = None
+        async for chunk in stream:
+            usage = getattr(chunk, "usage", None) or usage
+            for choice in getattr(chunk, "choices", None) or []:
+                delta = getattr(choice, "delta", None)
+                piece = getattr(delta, "content", None) if delta else None
+                if piece:
+                    parts.append(piece)
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+        message = SimpleNamespace(content="".join(parts), model_dump=lambda: {"content": "".join(parts)})
+        if usage is not None:
+            prompt_tokens = getattr(usage, "prompt_tokens", None)
+            logger.info(
+                f"【AI用量】model={model_name}, 输入={prompt_tokens}, "
+                f"输出={getattr(usage, 'completion_tokens', None)}"
+            )
+            if isinstance(prompt_tokens, int) and prompt_tokens > 20000:
+                logger.warning(
+                    f"【AI用量】输入token异常偏高({prompt_tokens})，本项目单次请求通常<3000，"
+                    f"多为API中转站额外注入的系统提示词，请检查API地址"
+                )
+        logger.debug(f"OpenAI流式回复完成: model={model_name}, 分片={len(parts)}, finish_reason={finish_reason}")
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=finish_reason)])
+
     async def _create_openai_completion(
         self,
         client: Any,
@@ -195,10 +251,13 @@ class AIReplyEngine:
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if disable_thinking:
             kwargs["extra_body"] = {"enable_thinking": False}
-        return await client.chat.completions.create(**kwargs)
+        stream = await client.chat.completions.create(**kwargs)
+        return await self._collect_openai_stream(stream, settings.get("model_name"))
 
     async def _create_openai_completion_with_fallbacks(
         self,
@@ -459,7 +518,7 @@ class AIReplyEngine:
         self,
         settings: Dict,
         messages: List[Dict],
-        max_tokens: int = 8192,
+        max_tokens: int = AI_REPLY_MAX_TOKENS,
         temperature: float = 0.5,
     ) -> str:
         """调用OpenAI兼容API"""
@@ -803,19 +862,27 @@ class AIReplyEngine:
                     )
                     return None
                 
-                # 获取对话历史
+                # 获取对话历史：排除本条消息（已单独作为"用户消息"发送），过滤串台回复并截断超长内容
                 context_stmt = (
                     select(AIChatMessage.role, AIChatMessage.content)
                     .where(
                         AIChatMessage.chat_id == chat_id,
                         AIChatMessage.cookie_id == cookie_id,
+                        AIChatMessage.id != user_message.id,
                     )
                     .order_by(AIChatMessage.created_at.desc())
-                    .limit(20)
+                    .limit(AI_HISTORY_MAX_MESSAGES * 2)
                 )
                 context_result = await db_session.execute(context_stmt)
-                context_rows = context_result.all()
-                context = [{"role": row[0], "content": row[1]} for row in reversed(context_rows)]
+                context = []
+                for role, content in reversed(context_result.all()):
+                    if role == "assistant" and self._is_abnormal_reply(content):
+                        continue
+                    context.append({
+                        "role": role,
+                        "content": self._shorten_text(content, AI_HISTORY_MAX_CHARS_PER_MESSAGE),
+                    })
+                context = context[-AI_HISTORY_MAX_MESSAGES:]
                 
                 # 获取议价次数
                 from sqlalchemy import func
@@ -882,9 +949,10 @@ class AIReplyEngine:
                 logger.info(f"[AI回复] 商品信息构建完成: {item_desc}")
                 
                 # 构建对话历史
-                context_str = "\n".join([
-                    f"{msg['role']}: {msg['content']}" for msg in context[-10:]
-                ])
+                role_labels = {"user": "买家", "assistant": "卖家"}
+                context_str = "\n".join(
+                    f"{role_labels.get(msg['role'], msg['role'])}: {msg['content']}" for msg in context
+                ) or "（无）"
                 
                 # 构建用户消息
                 max_bargain_rounds = settings.get("max_bargain_rounds", 3)
@@ -939,7 +1007,13 @@ class AIReplyEngine:
                     reply = await self._call_anthropic_api(settings, messages)
                 else:
                     reply = await self._call_openai_api(settings, messages)
-                
+
+                if reply and self._is_abnormal_reply(reply):
+                    logger.warning(
+                        f"【{cookie_id}】AI回复疑似串台（非客服内容），已拦截不发送: {reply[:80]}"
+                    )
+                    return None
+
                 if reply:
                     # 二次检测：大模型返回后，若人工已介入暂停，则放弃本次回复
                     if (

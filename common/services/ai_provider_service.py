@@ -464,6 +464,8 @@ async def test_ai_connection(
                 "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                # 显式关闭流式：部分中转站未传 stream 时默认返回 SSE，导致 JSON 解析失败
+                "stream": False,
             },
         )
         if response.status_code == 400:
@@ -484,6 +486,7 @@ async def test_ai_connection(
                     "messages": converted_messages,
                     "max_tokens": max_tokens,
                     "temperature": temperature,
+                    "stream": False,
                 },
             )
         ensure_success_response(response, get_ai_provider_name(provider, settings["base_url"], model))
